@@ -33,33 +33,26 @@
 ############################################################################
 
 from px4_mpc.models.multirotor_rate_model import MultirotorRateModel
-from px4_mpc.controllers.multirotor_rate_mpc import MultirotorRateMPC
-
-__author__ = "Jaeyoung Lim"
-__contact__ = "jalim@ethz.ch"
+from px4_mpc.controllers.multirotor_rate_tompc import MultirotorRateTOMPC
 
 import rclpy
 import numpy as np
 from rclpy.node import Node
 from rclpy.clock import Clock
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-
+from rclpy.qos import (
+    QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+)
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from visualization_msgs.msg import Marker
-
-from px4_msgs.msg import OffboardControlMode
-from px4_msgs.msg import VehicleStatus
-from px4_msgs.msg import VehicleAttitude
-from px4_msgs.msg import VehicleLocalPosition
-from px4_msgs.msg import VehicleRatesSetpoint
-
-from mpc_msgs.srv import SetPose
+from px4_msgs.msg import (
+    OffboardControlMode, VehicleStatus, VehicleAttitude,
+    VehicleLocalPosition, VehicleRatesSetpoint
+)
 
 def vector2PoseMsg(frame_id, position, attitude):
     pose_msg = PoseStamped()
-    # msg.header.stamp = Clock().now().nanoseconds / 1000
-    pose_msg.header.frame_id=frame_id
+    pose_msg.header.frame_id = frame_id
     pose_msg.pose.orientation.w = attitude[0]
     pose_msg.pose.orientation.x = attitude[1]
     pose_msg.pose.orientation.y = attitude[2]
@@ -69,10 +62,10 @@ def vector2PoseMsg(frame_id, position, attitude):
     pose_msg.pose.position.z = float(position[2])
     return pose_msg
 
-class QuadrotorMPC(Node):
 
+class QuadrotorTOMPC(Node):
     def __init__(self):
-        super().__init__('minimal_publisher')
+        super().__init__('quadrotor_tompc')
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
             durability=QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
@@ -80,80 +73,140 @@ class QuadrotorMPC(Node):
             depth=1
         )
 
+        # Subscriptions
+        self.trajectory_sub = self.create_subscription(
+            Path, '/trajectory', self.trajectory_callback, 10
+        )
         self.status_sub = self.create_subscription(
             VehicleStatus,
             '/fmu/out/vehicle_status',
             self.vehicle_status_callback,
-            qos_profile)
-
+            qos_profile
+        )
         self.attitude_sub = self.create_subscription(
             VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.vehicle_attitude_callback,
-            qos_profile)
+            qos_profile
+        )
         self.local_position_sub = self.create_subscription(
             VehicleLocalPosition,
             '/fmu/out/vehicle_local_position',
             self.vehicle_local_position_callback,
-            qos_profile)
+            qos_profile
+        )
 
-        self.set_pose_srv = self.create_service(SetPose, '/set_pose', self.add_set_pos_callback)
-
-        self.publisher_offboard_mode = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
-        self.publisher_rates_setpoint = self.create_publisher(VehicleRatesSetpoint, '/fmu/in/vehicle_rates_setpoint', qos_profile)
-        self.predicted_path_pub = self.create_publisher(Path, '/px4_mpc/predicted_path', 10)
+        # Publishers
+        self.publisher_offboard_mode = self.create_publisher(
+            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile
+        )
+        self.publisher_rates_setpoint = self.create_publisher(
+            VehicleRatesSetpoint, '/fmu/in/vehicle_rates_setpoint', qos_profile
+        )
+        self.predicted_path_pub = self.create_publisher(
+            Path, '/px4_mpc/predicted_path', 10
+        )
         self.reference_pub = self.create_publisher(Marker, "/px4_mpc/reference", 10)
 
-        timer_period = 0.02  # seconds
+        self.reference_path_pub = self.create_publisher(
+            Marker, 
+            '/px4_mpc/reference_path', 
+            10
+        )
+
+        # Timer
+        timer_period = 0.02  # 20 ms
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
 
+        # State variables
         self.nav_state = VehicleStatus.NAVIGATION_STATE_MAX
-
-        # Create Quadrotor and controller objects
-        self.model = MultirotorRateModel()
-
-        # Create MPC Solver
-        MPC_HORIZON = 15
-
-        # Spawn Controller
-        self.mpc = MultirotorRateMPC(self.model)
-        # self.ctl = SetpointMPC(model=self.quad,
-        #                 dynamics=self.quad.model,
-        #                 param='P1',
-        #                 N=MPC_HORIZON,
-        #                 ulb=ulb, uub=uub, xlb=xlb, xub=xub)
-
         self.vehicle_attitude = np.array([1.0, 0.0, 0.0, 0.0])
         self.vehicle_local_position = np.array([0.0, 0.0, 0.0])
         self.vehicle_local_velocity = np.array([0.0, 0.0, 0.0])
-        self.setpoint_position = np.array([0.0, 0.0, 3.0])
+
+        # MPC setup
+        MPC_HORIZON = 50
+        self.model = MultirotorRateModel()
+        self.reference_trajectory = np.zeros((MPC_HORIZON, 16))  
+        # [x_ref, y_ref, z_ref, qw_ref, qx_ref, qy_ref, qz_ref]
+
+        self.mpc = MultirotorRateTOMPC(self.model, self.reference_trajectory)
+
+    def trajectory_callback(self, msg):
+        """
+        Callback to receive trajectory from a Path message.
+        We assume each Pose in msg.poses has a position + quaternion orientation.
+        """
+        waypoints = msg.poses
+        horizon = min(len(waypoints), self.mpc.N)
+
+        for i in range(horizon):
+            self.reference_trajectory[i, :] = [
+                waypoints[i].pose.position.x,
+                waypoints[i].pose.position.y,
+                waypoints[i].pose.position.z,
+                waypoints[i].pose.orientation.w,
+                waypoints[i].pose.orientation.x,
+                waypoints[i].pose.orientation.y,
+                waypoints[i].pose.orientation.z
+            ]
+
+        # If fewer waypoints than N, repeat the last for the remainder
+        if len(waypoints) < self.mpc.N:
+            for i in range(len(waypoints), self.mpc.N):
+                self.reference_trajectory[i, :] = self.reference_trajectory[len(waypoints) - 1, :]
+
+        # Publish the reference trajectory path for visualization
+        self.publish_reference_path()
+
+    def publish_reference_path(self):
+        """
+        Publishes the reference trajectory as a line strip using visualization_msgs/Marker.
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.ns = "reference_trajectory"
+        marker.id = 1
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.1  # Line thickness
+        marker.color.r = 0.0
+        marker.color.g = 1.0  # Green color for reference trajectory
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+
+        # Add points from the reference trajectory
+        for i in range(self.mpc.N):
+            point = Point()
+            point.x = self.reference_trajectory[i, 0]  # px
+            point.y = self.reference_trajectory[i, 1]  # py
+            point.z = self.reference_trajectory[i, 2]  # pz
+            marker.points.append(point)
+
+        self.reference_path_pub.publish(marker)
 
     def vehicle_attitude_callback(self, msg):
-        # TODO: handle NED->ENU transformation 
         self.vehicle_attitude[0] = msg.q[0]
         self.vehicle_attitude[1] = msg.q[1]
-        self.vehicle_attitude[2] = -msg.q[2]
-        self.vehicle_attitude[3] = -msg.q[3]
+        self.vehicle_attitude[2] = msg.q[2]
+        self.vehicle_attitude[3] = msg.q[3]
 
     def vehicle_local_position_callback(self, msg):
-        # TODO: handle NED->ENU transformation 
         self.vehicle_local_position[0] = msg.x
-        self.vehicle_local_position[1] = -msg.y
-        self.vehicle_local_position[2] = -msg.z
+        self.vehicle_local_position[1] = msg.y
+        self.vehicle_local_position[2] = msg.z
         self.vehicle_local_velocity[0] = msg.vx
-        self.vehicle_local_velocity[1] = -msg.vy
-        self.vehicle_local_velocity[2] = -msg.vz
+        self.vehicle_local_velocity[1] = msg.vy
+        self.vehicle_local_velocity[2] = msg.vz
 
     def vehicle_status_callback(self, msg):
-        # print("NAV_STATUS: ", msg.nav_state)
-        # print("  - offboard status: ", VehicleStatus.NAVIGATION_STATE_OFFBOARD)
         self.nav_state = msg.nav_state
-    
+
     def publish_reference(self, pub, reference):
+        # reference is [x, y, z]
         msg = Marker()
         msg.action = Marker.ADD
         msg.header.frame_id = "map"
-        # msg.header.stamp = Clock().now().nanoseconds / 1000
         msg.ns = "arrow"
         msg.id = 1
         msg.type = Marker.SPHERE
@@ -168,70 +221,73 @@ class QuadrotorMPC(Node):
         msg.pose.position.y = reference[1]
         msg.pose.position.z = reference[2]
         msg.pose.orientation.w = 1.0
-        msg.pose.orientation.x = 0.0
-        msg.pose.orientation.y = 0.0
-        msg.pose.orientation.z = 0.0
-
         pub.publish(msg)
 
     def cmdloop_callback(self):
-        # Publish offboard control modes
         offboard_msg = OffboardControlMode()
         offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-        offboard_msg.position=False
-        offboard_msg.velocity=False
-        offboard_msg.acceleration=False
+        offboard_msg.position = False
+        offboard_msg.velocity = False
+        offboard_msg.acceleration = False
         offboard_msg.attitude = False
         offboard_msg.body_rate = True
         self.publisher_offboard_mode.publish(offboard_msg)
 
-        error_position = self.vehicle_local_position - self.setpoint_position
+        # Construct the state vector from current measured states
+        x0 = np.array([
+            self.vehicle_local_position[0],
+            self.vehicle_local_position[1],
+            self.vehicle_local_position[2],
+            self.vehicle_local_velocity[0],
+            self.vehicle_local_velocity[1],
+            self.vehicle_local_velocity[2],
+            self.vehicle_attitude[0],
+            self.vehicle_attitude[1],
+            self.vehicle_attitude[2],
+            self.vehicle_attitude[3]
+        ]).reshape(10, 1)
 
-        x0 = np.array([error_position[0], error_position[1], error_position[2],
-         self.vehicle_local_velocity[0], self.vehicle_local_velocity[1], self.vehicle_local_velocity[2], 
-         self.vehicle_attitude[0], self.vehicle_attitude[1], self.vehicle_attitude[2], self.vehicle_attitude[3]]).reshape(10, 1)
+        # Solve the MPC problem
+        try:
+            u_pred, x_pred = self.mpc.solve(x0, self.reference_trajectory)
+        except Exception as e:
+            self.get_logger().error(f"MPC solver failed: {e}")
+            return
 
-        u_pred, x_pred = self.mpc.solve(x0)
-
-        idx = 0
+        # Publish predicted path
         predicted_path_msg = Path()
+        predicted_path_msg.header.frame_id = 'map'
         for predicted_state in x_pred:
-            idx = idx + 1
-                # Publish time history of the vehicle path
-            predicted_pose_msg = vector2PoseMsg('map', predicted_state[0:3] + self.setpoint_position, np.array([1.0, 0.0, 0.0, 0.0]))
-            predicted_path_msg.header = predicted_pose_msg.header
+            predicted_pose_msg = vector2PoseMsg(
+                'map',
+                predicted_state[0:3],
+                predicted_state[6:10]  # Orientation
+            )
             predicted_path_msg.poses.append(predicted_pose_msg)
         self.predicted_path_pub.publish(predicted_path_msg)
-        self.publish_reference(self.reference_pub, self.setpoint_position)
 
+        # Publish reference (just the first reference point in the horizon)
+        self.publish_reference(self.reference_pub, self.reference_trajectory[0, 0:3])
+
+        # Compute thrust and rates
         thrust_rates = u_pred[0, :]
-        # Hover thrust = 0.73
-        thrust_command = -(thrust_rates[0] * 0.07 + 0.0)
+        thrust_command = -(thrust_rates[0] * 0.07)  # Hover thrust offset as needed
         if self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
             setpoint_msg = VehicleRatesSetpoint()
             setpoint_msg.timestamp = int(Clock().now().nanoseconds / 1000)
-            setpoint_msg.roll = float(thrust_rates[1])
+            setpoint_msg.roll  = float(thrust_rates[1])
             setpoint_msg.pitch = float(-thrust_rates[2])
-            setpoint_msg.yaw = float(-thrust_rates[3])
+            setpoint_msg.yaw   = float(-thrust_rates[3])
             setpoint_msg.thrust_body[0] = 0.0
             setpoint_msg.thrust_body[1] = 0.0
             setpoint_msg.thrust_body[2] = float(thrust_command)
             self.publisher_rates_setpoint.publish(setpoint_msg)
 
-    def add_set_pos_callback(self, request, response):
-        self.setpoint_position[0] = request.pose.position.x
-        self.setpoint_position[1] = request.pose.position.y
-        self.setpoint_position[2] = request.pose.position.z
-
-        return response
 
 def main(args=None):
     rclpy.init(args=args)
-
-    quadrotor_mpc = QuadrotorMPC()
-
+    quadrotor_mpc = QuadrotorTOMPC()
     rclpy.spin(quadrotor_mpc)
-
     quadrotor_mpc.destroy_node()
     rclpy.shutdown()
 

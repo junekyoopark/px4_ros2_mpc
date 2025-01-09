@@ -26,6 +26,9 @@ setup(
     entry_points={
         'console_scripts': [
                 'mpc_quadrotor = px4_mpc.mpc_quadrotor:main',
+                'mpc_quadrotor_path = px4_mpc.mpc_quadrotor_path:main',
+                'mpc_quadrotor_path_service = px4_mpc.mpc_quadrotor_path_service:main',
+                'tompc_quadrotor = px4_mpc.tompc_quadrotor:main',
                 'mpc_spacecraft = px4_mpc.mpc_spacecraft:main',
                 'test_setpoints = px4_mpc.test.test_setpoints:main',
                 'rviz_pos_marker = px4_mpc.rviz_pos_marker:main',

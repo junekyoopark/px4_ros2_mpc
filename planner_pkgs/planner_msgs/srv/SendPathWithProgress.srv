@@ -1,0 +1,5 @@
+nav_msgs/Path path     # Path with poses
+float32[] progress     # Progress values corresponding to each pose (normalized, 0 to 1)
+---
+bool success           # Indicate whether the service call succeeded
+string message         # Additional message about the result
